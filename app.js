@@ -182,7 +182,7 @@ async function handleRegister() {
                     { alg: -257, type: 'public-key' }
                 ],
                 authenticatorSelection: {
-                    authenticatorAttachment: 'platform',
+                    authenticatorAttachment: providerInfo.authenticatorAttachment,
                     userVerification: 'required',
                     residentKey: 'required'
                 },
