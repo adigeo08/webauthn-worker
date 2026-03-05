@@ -5,6 +5,9 @@ const LAST_USER_KEY = 'did_last_username';
 
 let didJwtModule;
 
+/* =========================
+   SW
+   ========================= */
 async function registerServiceWorker() {
   if (!['http:', 'https:'].includes(window.location.protocol)) {
     log('Service Worker dezactivat: Protocol nesuportat (rulezi fișierul local?).', true);
@@ -20,16 +23,33 @@ async function registerServiceWorker() {
   }
 }
 
+/* =========================
+   MOCK "SERVER" (LOCAL)
+   =========================
+   passkey_db schema:
+   {
+     [username]: {
+       id: string,
+       rawId: base64,
+       publicKey: base64 (optional),
+       publicKeyAlgorithm: number|'unknown',
+       userId: base64 (16 bytes)  <-- IMPORTANT for binding
+     }
+   }
+*/
 const MockServer = {
   getUsers: () => JSON.parse(localStorage.getItem('passkey_db') || '{}'),
   saveUser: (name, cred) => {
     const db = MockServer.getUsers();
-    db[name] = cred;
+    db[name] = { ...(db[name] || {}), ...cred };
     localStorage.setItem('passkey_db', JSON.stringify(db));
   },
   generateChallenge: () => crypto.getRandomValues(new Uint8Array(32))
 };
 
+/* =========================
+   BASE64 HELPERS
+   ========================= */
 const toBase64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
 const fromBase64 = (str) => Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
 
@@ -58,6 +78,16 @@ function decodeJwtNoVerify(jwt) {
   }
 }
 
+function bytesEqual(a, b) {
+  if (!a || !b) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/* =========================
+   PROVIDER DETECT
+   ========================= */
 function detectProvider() {
   const ua = navigator.userAgent.toLowerCase();
   const platform =
@@ -68,7 +98,7 @@ function detectProvider() {
   }
 
   if (platform.includes('win') || ua.includes('windows')) {
-    // AGRESIV: scoatem hint-ul "security-key" ca să nu împingă spre roaming
+    // "mai agresiv" spre platform: scoatem security-key ca hint
     return { provider: 'Windows Hello', os: 'windows', hints: ['client-device'] };
   }
 
@@ -79,6 +109,9 @@ function detectProvider() {
   return { provider: 'Provider platform implicit', os: 'other', hints: ['client-device'] };
 }
 
+/* =========================
+   UI HELPERS
+   ========================= */
 function log(msg, err = false) {
   const d = document.getElementById('debug-log');
   d.innerHTML += `<div class="${err ? 'text-red-400' : ''}">> ${msg}</div>`;
@@ -94,6 +127,9 @@ function showStatus(txt, err = false) {
   s.classList.remove('hidden');
 }
 
+/* =========================
+   COOKIES + SESSION
+   ========================= */
 function clearCookies() {
   document.cookie.split(';').forEach((cookie) => {
     const [name] = cookie.split('=');
@@ -113,6 +149,9 @@ function setSessionCookie(jwt, maxAgeSeconds = 3600) {
     `${SESSION_COOKIE}=${encodeURIComponent(jwt)};path=/;SameSite=Lax;Max-Age=${maxAgeSeconds}${securePart}`;
 }
 
+/* =========================
+   STORAGE RESET
+   ========================= */
 function clearData() {
   localStorage.removeItem('passkey_db');
   localStorage.removeItem(LAST_USER_KEY);
@@ -121,6 +160,9 @@ function clearData() {
   location.reload();
 }
 
+/* =========================
+   INDEXEDDB (PUBLIC ACCOUNT VIEW)
+   ========================= */
 function openAccountDb() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(ACCOUNT_DB_NAME, 1);
@@ -158,6 +200,9 @@ async function getPublicAccountData(username) {
   return result;
 }
 
+/* =========================
+   DID-JWT
+   ========================= */
 async function initDidJwt() {
   if (!didJwtModule) {
     didJwtModule = await import('https://esm.sh/did-jwt@8.0.18');
@@ -168,10 +213,9 @@ async function initDidJwt() {
 async function createDidSession(username, nonce) {
   const didJwt = await initDidJwt();
 
-  // ES256KSigner => Uint8Array(32)
+  // ES256KSigner expects Uint8Array(32)
   const privateKeyBytes = crypto.getRandomValues(new Uint8Array(32));
   const signer = didJwt.ES256KSigner(privateKeyBytes, true);
-
   const issuer = `did:example:${username}`;
 
   const jwt = await didJwt.createJWT(
@@ -184,6 +228,9 @@ async function createDidSession(username, nonce) {
   return jwt;
 }
 
+/* =========================
+   RENDER
+   ========================= */
 function renderAccountView(accountData) {
   document.getElementById('auth-view').classList.add('hidden');
   document.getElementById('account-view').classList.remove('hidden');
@@ -195,6 +242,9 @@ function renderAccountView(accountData) {
   document.getElementById('account-session').innerText = accountData.didSessionJwt;
 }
 
+/* =========================
+   REGISTER
+   ========================= */
 async function handleRegister() {
   const user = document.getElementById('username').value.trim();
   if (!user) return showStatus('Introdu un utilizator', true);
@@ -204,7 +254,7 @@ async function handleRegister() {
     log(`Inițiez crearea cheii prin ${providerInfo.provider}...`);
 
     const challenge = MockServer.generateChallenge();
-    const userId = crypto.getRandomValues(new Uint8Array(16));
+    const userId = crypto.getRandomValues(new Uint8Array(16)); // we will store this
 
     const options = {
       publicKey: {
@@ -212,8 +262,8 @@ async function handleRegister() {
         rp: { name: 'Passkey PWA', id: window.location.hostname || 'localhost' },
         user: { id: userId, name: user, displayName: user },
         pubKeyCredParams: [
-          { alg: -7, type: 'public-key' },
-          { alg: -257, type: 'public-key' }
+          { alg: -7, type: 'public-key' },   // ES256
+          { alg: -257, type: 'public-key' }  // RS256
         ],
         authenticatorSelection: {
           authenticatorAttachment: 'platform',
@@ -234,11 +284,13 @@ async function handleRegister() {
         ? response.getPublicKeyAlgorithm()
         : 'unknown';
 
+    // Persist: rawId + userId (for later binding via userHandle)
     MockServer.saveUser(user, {
       id: credential.id,
       rawId: toBase64(credential.rawId),
       publicKey: toBase64(response.getPublicKey()),
-      publicKeyAlgorithm: alg
+      publicKeyAlgorithm: alg,
+      userId: toBase64(userId) // IMPORTANT
     });
 
     log(`Passkey salvat. Alg: ${alg}`);
@@ -249,25 +301,18 @@ async function handleRegister() {
   }
 }
 
-function requireLocalCredential(user, data) {
-  // AGRESIV: fără allowCredentials => refuzăm login
-  if (!data?.rawId) {
-    showStatus(
-      'Nu există passkey local pentru acest user pe device-ul curent. Fă Register pe acest device (platform/Windows Hello) înainte de Login.',
-      true
-    );
-    log('Login refuzat: allowCredentials ar fi gol (nu permitem discoverable/cloud picker).', true);
-    return false;
-  }
-  return true;
-}
-
+/* =========================
+   LOGIN (2-step)
+   - If we know rawId => strict allowCredentials + transports internal
+   - Else => discoverable login to "learn" rawId
+   - Binding check: if we have stored userId, verify assertion.response.userHandle matches it
+     (when userHandle is present)
+   ========================= */
 async function handleLogin() {
   const user = document.getElementById('username').value.trim();
-  const data = MockServer.getUsers()[user];
   if (!user) return showStatus('Introdu un utilizator', true);
 
-  if (!requireLocalCredential(user, data)) return;
+  const known = MockServer.getUsers()[user]; // may be undefined
 
   try {
     const providerInfo = detectProvider();
@@ -276,12 +321,22 @@ async function handleLogin() {
     const challenge = MockServer.generateChallenge();
     const localNonce = base64Url(crypto.getRandomValues(new Uint8Array(16)));
 
-    // AGRESIV: allowCredentials obligatoriu + transports internal
-    const allowCredentials = [{
-      id: fromBase64(data.rawId),
-      type: 'public-key',
-      transports: ['internal']
-    }];
+    const hasRawId = !!known?.rawId;
+
+    const allowCredentials = hasRawId
+      ? [{
+          id: fromBase64(known.rawId),
+          type: 'public-key',
+          transports: ['internal']
+        }]
+      : []; // discoverable picker (first-time bind)
+
+    if (!hasRawId) {
+      log(
+        'Nu am credentialId (rawId) salvat pentru acest username. Permit login discoverable ca să îl învăț, apoi devine strict.',
+        true
+      );
+    }
 
     const options = {
       publicKey: {
@@ -295,7 +350,42 @@ async function handleLogin() {
     };
 
     const assertion = await navigator.credentials.get(options);
+
+    // ===== Binding check via userHandle (when available) =====
+    // userHandle is a BufferSource or null; present especially for discoverable credentials.
+    const userHandle = assertion?.response?.userHandle
+      ? new Uint8Array(assertion.response.userHandle)
+      : null;
+
+    const storedUserIdBytes = known?.userId ? fromBase64(known.userId) : null;
+
+    // If we have stored userId and we receive userHandle, they MUST match.
+    // If they don't match -> user picked a different passkey than the username they typed.
+    if (storedUserIdBytes && userHandle && !bytesEqual(userHandle, storedUserIdBytes)) {
+      log('SECURITY: userHandle NU se potrivește cu userId salvat. Username pare legat de alt passkey.', true);
+      showStatus('Ai ales o altă cheie decât cea înregistrată pentru acest username. Verifică username-ul.', true);
+      return;
+    }
+
+    // If we didn't have userId stored yet (e.g., username existed without prior register),
+    // and we got userHandle now, bind it (safe-ish) to this username.
+    if (!storedUserIdBytes && userHandle) {
+      MockServer.saveUser(user, { userId: toBase64(userHandle) });
+      log('Am salvat userId (din userHandle) pentru binding-ul username <-> passkey.');
+    }
+
+    // ===== Learn rawId after successful assertion (for future strict logins) =====
+    if (!hasRawId) {
+      MockServer.saveUser(user, {
+        id: assertion.id,
+        rawId: toBase64(assertion.rawId)
+      });
+      log(`Am învățat și salvat rawId pentru "${user}". De acum login-ul poate fi strict (internal).`);
+    }
+
     const sessionJwt = await createDidSession(user, localNonce);
+
+    const updated = MockServer.getUsers()[user] || {};
 
     const publicAccountData = {
       username: user,
@@ -306,7 +396,7 @@ async function handleLogin() {
       authenticatorAttachment: 'platform',
       authenticatorProvider: providerInfo.provider,
       clientExtensionResults: assertion.getClientExtensionResults(),
-      publicKeyAlgorithm: data?.publicKeyAlgorithm ?? 'unknown',
+      publicKeyAlgorithm: updated.publicKeyAlgorithm ?? 'unknown',
 
       lastLoginAt: new Date().toISOString(),
       didSessionJwt: sessionJwt,
@@ -318,14 +408,16 @@ async function handleLogin() {
     renderAccountView(account);
 
     log(`Login OK. Nonce DID: ${localNonce}`);
-    showStatus('Te-ai logat cu succes (platform/internal)!');
-
+    showStatus('Te-ai logat cu succes!');
   } catch (e) {
     log(e.name + ': ' + e.message, true);
     showStatus('Eroare la autentificare', true);
   }
 }
 
+/* =========================
+   LOGOUT
+   ========================= */
 async function handleLogout() {
   clearCookies();
   localStorage.removeItem(LAST_USER_KEY);
@@ -343,6 +435,9 @@ async function handleLogout() {
   log('Logout: sesiune locală ștearsă.');
 }
 
+/* =========================
+   RESTORE SESSION
+   ========================= */
 async function tryRestoreSessionFromCookie() {
   const jwt = getCookie(SESSION_COOKIE);
   if (!jwt) return false;
@@ -364,11 +459,17 @@ async function tryRestoreSessionFromCookie() {
   return true;
 }
 
+/* =========================
+   EXPOSE
+   ========================= */
 window.handleRegister = handleRegister;
 window.handleLogin = handleLogin;
 window.handleLogout = handleLogout;
 window.clearData = clearData;
 
+/* =========================
+   ONLOAD
+   ========================= */
 window.onload = async () => {
   const providerInfo = detectProvider();
   document.getElementById('provider-name').innerText = providerInfo.provider;
