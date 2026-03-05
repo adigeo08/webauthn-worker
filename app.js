@@ -42,22 +42,16 @@ function detectProvider() {
     const platform = navigator.userAgentData?.platform?.toLowerCase() || navigator.platform.toLowerCase();
 
     if (ua.includes('android')) {
-        return { provider: 'Google Password Manager', registrationProvider: 'Google Password Manager', os: 'android', hints: ['client-device'], authenticatorAttachment: 'platform' };
+        return { provider: 'Google Password Manager', os: 'android', hints: ['client-device'] };
     }
     if (platform.includes('win') || ua.includes('windows')) {
-        return {
-            provider: 'Windows (USB Security Key)',
-            registrationProvider: 'USB Security Key',
-            os: 'windows',
-            hints: ['security-key'],
-            authenticatorAttachment: 'cross-platform'
-        };
+        return { provider: 'Windows Hello', os: 'windows', hints: ['security-key', 'client-device'] };
     }
     if (platform.includes('mac') || ua.includes('iphone') || ua.includes('ipad') || ua.includes('ios')) {
-        return { provider: 'Apple Passwords / iCloud Keychain', registrationProvider: 'Apple Passwords / iCloud Keychain', os: 'apple', hints: ['client-device'], authenticatorAttachment: 'platform' };
+        return { provider: 'Apple Passwords / iCloud Keychain', os: 'apple', hints: ['client-device'] };
     }
 
-    return { provider: 'Provider platform implicit', registrationProvider: 'Provider platform implicit', os: 'other', hints: ['client-device'], authenticatorAttachment: 'platform' };
+    return { provider: 'Provider platform implicit', os: 'other', hints: ['client-device'] };
 }
 
 function log(msg, err = false) {
@@ -133,8 +127,8 @@ async function initDidJwt() {
 
 async function createDidSession(username, nonce) {
     const didJwt = await initDidJwt();
-    const privateKeyBytes = crypto.getRandomValues(new Uint8Array(32));
-    const signer = didJwt.ES256KSigner(privateKeyBytes, true);
+    const privateKeyHex = Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, '0')).join('');
+    const signer = didJwt.ES256KSigner(privateKeyHex, true);
     const issuer = `did:example:${username}`;
 
     const jwt = await didJwt.createJWT(
@@ -173,7 +167,7 @@ async function handleRegister() {
 
     try {
         const providerInfo = detectProvider();
-        log(`Inițiez crearea cheii prin ${providerInfo.registrationProvider}...`);
+        log(`Inițiez crearea cheii prin ${providerInfo.provider}...`);
 
         const challenge = MockServer.generateChallenge();
         const userId = crypto.getRandomValues(new Uint8Array(16));
@@ -208,7 +202,7 @@ async function handleRegister() {
         });
 
         log('Passkey salvat în sistem!');
-        showStatus(`Înregistrare finalizată prin ${providerInfo.registrationProvider}!`);
+        showStatus(`Înregistrare finalizată prin ${providerInfo.provider}!`);
     } catch (e) {
         log(e.name + ': ' + e.message, true);
         showStatus('Eroare la înregistrare. Verifică log-ul.', true);
