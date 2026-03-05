@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autentificare cu Passkeys & PWA</title>
+    
+    <!-- Meta tags pentru PWA -->
+    <meta name="theme-color" content="#2563eb">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #f3f4f6;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .glass-card {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        #debug-log::-webkit-scrollbar {
+            width: 4px;
+        }
+        #debug-log::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+
+    <div class="max-w-md w-full glass-card p-8 rounded-2xl shadow-xl">
+        <div class="text-center mb-8">
+            <div class="inline-flex items-center justify-center w-16 h-16 bg-blue-100 text-blue-600 rounded-full mb-4">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+                </svg>
+            </div>
+            <h1 class="text-2xl font-bold text-gray-800">Sistem Passkey PWA</h1>
+            <p class="text-gray-500 mt-2">Securizat cu Service Worker</p>
+        </div>
+
+        <div id="status-message" class="hidden mb-4 p-3 rounded-lg text-sm text-center"></div>
+
+        <div id="security-warning" class="hidden mb-6 p-4 bg-amber-50 border border-amber-200 rounded-lg">
+            <p class="text-amber-800 text-xs font-bold flex items-center gap-2">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd" />
+                </svg>
+                Mediu de testare limitat
+            </p>
+            <p id="warning-text" class="text-amber-700 text-[10px] mt-2">
+                WebAuthn și Service Workers necesită un server web (HTTPS sau localhost). Protocolul curent ('null' sau 'file:') nu este suportat.
+            </p>
+        </div>
+
+        <div class="space-y-4">
+            <div>
+                <label for="username" class="block text-sm font-medium text-gray-700 mb-1">Utilizator</label>
+                <input type="text" id="username" autocomplete="username webauthn" class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all" placeholder="utilizator@exemplu.ro">
+            </div>
+
+            <div class="grid grid-cols-2 gap-4 mt-6">
+                <button onclick="handleRegister()" class="w-full bg-white border-2 border-blue-600 text-blue-600 font-semibold py-2 rounded-lg hover:bg-blue-50 transition-colors">
+                    Înregistrare
+                </button>
+                <button onclick="handleLogin()" class="w-full bg-blue-600 text-white font-semibold py-2 rounded-lg hover:bg-blue-700 shadow-lg shadow-blue-200 transition-colors">
+                    Autentificare
+                </button>
+            </div>
+        </div>
+
+        <div class="mt-8 pt-6 border-t border-gray-100">
+            <div class="flex justify-between items-center mb-3">
+                <h3 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Log Aplicație</h3>
+                <button onclick="clearData()" class="text-[10px] text-red-500 hover:underline">Reset</button>
+            </div>
+            <div id="debug-log" class="text-[10px] font-mono bg-gray-900 p-3 rounded h-32 overflow-y-auto text-green-400">
+                Initializare...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- LOGICA SERVICE WORKER ---
+        const swCode = `
+            const CACHE_NAME = 'passkey-v1';
+            self.addEventListener('install', (e) => self.skipWaiting());
+            self.addEventListener('activate', (e) => e.waitUntil(clients.claim()));
+            self.addEventListener('fetch', (e) => e.respondWith(fetch(e.request).catch(() => caches.match(e.request))));
+        `;
+
+        async function registerServiceWorker() {
+            // Verificăm dacă suntem pe un protocol valid pentru SW (http/https)
+            if (!['http:', 'https:'].includes(window.location.protocol)) {
+                log("Service Worker dezactivat: Protocol nesuportat (rulezi fișierul local?).", true);
+                return;
+            }
+
+            if ('serviceWorker' in navigator) {
+                try {
+                    const blob = new Blob([swCode], { type: 'application/javascript' });
+                    const swUrl = URL.createObjectURL(blob);
+                    const registration = await navigator.serviceWorker.register(swUrl);
+                    log("Service Worker înregistrat.");
+                } catch (e) {
+                    log("Eșec Service Worker: " + e.message, true);
+                }
+            }
+        }
+
+        // --- LOGICA WEBAUTHN ---
+        const MockServer = {
+            getUsers: () => JSON.parse(localStorage.getItem('passkey_db') || '{}'),
+            saveUser: (name, cred) => {
+                const db = MockServer.getUsers();
+                db[name] = cred;
+                localStorage.setItem('passkey_db', JSON.stringify(db));
+            },
+            generateChallenge: () => crypto.getRandomValues(new Uint8Array(32))
+        };
+
+        const toBase64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+        const fromBase64 = (str) => Uint8Array.from(atob(str), c => c.charCodeAt(0));
+
+        function log(msg, err = false) {
+            const d = document.getElementById('debug-log');
+            d.innerHTML += `<div class="${err ? 'text-red-400' : ''}">> ${msg}</div>`;
+            d.scrollTop = d.scrollHeight;
+        }
+
+        function showStatus(txt, err = false) {
+            const s = document.getElementById('status-message');
+            s.innerText = txt;
+            s.className = `mb-4 p-3 rounded-lg text-sm text-center ${err ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`;
+            s.classList.remove('hidden');
+        }
+
+        function clearData() {
+            localStorage.removeItem('passkey_db');
+            location.reload();
+        }
+
+        async function handleRegister() {
+            const user = document.getElementById('username').value;
+            if (!user) return showStatus("Introdu un utilizator", true);
+
+            try {
+                log("Inițiez crearea cheii...");
+                const challenge = MockServer.generateChallenge();
+                const userId = crypto.getRandomValues(new Uint8Array(16));
+
+                const options = {
+                    publicKey: {
+                        challenge: challenge,
+                        rp: { name: "Passkey PWA", id: window.location.hostname || "localhost" },
+                        user: { id: userId, name: user, displayName: user },
+                        pubKeyCredParams: [{ alg: -7, type: "public-key" }],
+                        authenticatorSelection: {
+                            authenticatorAttachment: "platform",
+                            userVerification: "required",
+                            residentKey: "required"
+                        },
+                        timeout: 60000
+                    }
+                };
+
+                const credential = await navigator.credentials.create(options);
+                
+                MockServer.saveUser(user, {
+                    id: credential.id,
+                    rawId: toBase64(credential.rawId),
+                    publicKey: toBase64(credential.response.getPublicKey())
+                });
+
+                log("Passkey salvat în sistem!");
+                showStatus("Înregistrare finalizată!");
+            } catch (e) {
+                log(e.name + ": " + e.message, true);
+                showStatus("Eroare la înregistrare. Verifică log-ul.", true);
+            }
+        }
+
+        async function handleLogin() {
+            const user = document.getElementById('username').value;
+            const data = MockServer.getUsers()[user];
+
+            try {
+                log("Solicit autentificare...");
+                const challenge = MockServer.generateChallenge();
+
+                const options = {
+                    publicKey: {
+                        challenge: challenge,
+                        rpId: window.location.hostname || "localhost",
+                        userVerification: "required",
+                        allowCredentials: data ? [{ id: fromBase64(data.rawId), type: "public-key" }] : []
+                    }
+                };
+
+                const assertion = await navigator.credentials.get(options);
+                log("Autentificare reușită!");
+                showStatus("Te-ai logat cu succes!");
+            } catch (e) {
+                log(e.name + ": " + e.message, true);
+                showStatus("Eroare la autentificare", true);
+            }
+        }
+
+        window.onload = () => {
+            const isLocalFile = window.location.protocol === 'file:' || window.location.protocol === 'null';
+            const isSecure = window.isSecureContext;
+
+            if (isLocalFile || !isSecure) {
+                document.getElementById('security-warning').classList.remove('hidden');
+            }
+
+            registerServiceWorker();
+        };
+    </script>
+</body>
+</html>
