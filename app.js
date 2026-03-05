@@ -1,6 +1,7 @@
 const ACCOUNT_DB_NAME = 'webauthn_account_db';
 const ACCOUNT_STORE = 'public_accounts';
 const SESSION_COOKIE = 'did_session';
+const LAST_USER_KEY = 'did_last_username';
 
 let didJwtModule;
 
@@ -9,7 +10,6 @@ async function registerServiceWorker() {
     log('Service Worker dezactivat: Protocol nesuportat (rulezi fișierul local?).', true);
     return;
   }
-
   if ('serviceWorker' in navigator) {
     try {
       await navigator.serviceWorker.register('sw.js');
@@ -40,6 +40,24 @@ function base64Url(bytes) {
     .replace(/=+$/, '');
 }
 
+function base64UrlToBase64(s) {
+  let b64 = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = b64.length % 4;
+  if (pad) b64 += '='.repeat(4 - pad);
+  return b64;
+}
+
+function decodeJwtNoVerify(jwt) {
+  try {
+    const parts = String(jwt || '').split('.');
+    if (parts.length !== 3) return null;
+    const payloadJson = atob(base64UrlToBase64(parts[1]));
+    return JSON.parse(payloadJson);
+  } catch {
+    return null;
+  }
+}
+
 function detectProvider() {
   const ua = navigator.userAgent.toLowerCase();
   const platform =
@@ -48,9 +66,12 @@ function detectProvider() {
   if (ua.includes('android')) {
     return { provider: 'Google Password Manager', os: 'android', hints: ['client-device'] };
   }
+
   if (platform.includes('win') || ua.includes('windows')) {
-    return { provider: 'Windows Hello', os: 'windows', hints: ['security-key', 'client-device'] };
+    // AGRESIV: scoatem hint-ul "security-key" ca să nu împingă spre roaming
+    return { provider: 'Windows Hello', os: 'windows', hints: ['client-device'] };
   }
+
   if (platform.includes('mac') || ua.includes('iphone') || ua.includes('ipad') || ua.includes('ios')) {
     return { provider: 'Apple Passwords / iCloud Keychain', os: 'apple', hints: ['client-device'] };
   }
@@ -80,8 +101,21 @@ function clearCookies() {
   });
 }
 
+function getCookie(name) {
+  const m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+  return m ? decodeURIComponent(m[2]) : null;
+}
+
+function setSessionCookie(jwt, maxAgeSeconds = 3600) {
+  const isHttps = window.location.protocol === 'https:';
+  const securePart = isHttps ? ';Secure' : '';
+  document.cookie =
+    `${SESSION_COOKIE}=${encodeURIComponent(jwt)};path=/;SameSite=Lax;Max-Age=${maxAgeSeconds}${securePart}`;
+}
+
 function clearData() {
   localStorage.removeItem('passkey_db');
+  localStorage.removeItem(LAST_USER_KEY);
   clearCookies();
   indexedDB.deleteDatabase(ACCOUNT_DB_NAME);
   location.reload();
@@ -134,28 +168,19 @@ async function initDidJwt() {
 async function createDidSession(username, nonce) {
   const didJwt = await initDidJwt();
 
-  // FIX #2: ES256KSigner primește corect Uint8Array(32), nu hex string
+  // ES256KSigner => Uint8Array(32)
   const privateKeyBytes = crypto.getRandomValues(new Uint8Array(32));
-
   const signer = didJwt.ES256KSigner(privateKeyBytes, true);
+
   const issuer = `did:example:${username}`;
 
   const jwt = await didJwt.createJWT(
-    {
-      sub: username,
-      nonce,
-      provider: detectProvider().provider,
-      purpose: 'webauthn-session'
-    },
-    {
-      issuer,
-      signer,
-      alg: 'ES256K',
-      expiresIn: 60 * 60
-    }
+    { sub: username, nonce, provider: detectProvider().provider, purpose: 'webauthn-session' },
+    { issuer, signer, alg: 'ES256K', expiresIn: 60 * 60 }
   );
 
-  document.cookie = `${SESSION_COOKIE}=${jwt};path=/;SameSite=Lax;Secure`;
+  setSessionCookie(jwt, 60 * 60);
+  localStorage.setItem(LAST_USER_KEY, username);
   return jwt;
 }
 
@@ -191,7 +216,6 @@ async function handleRegister() {
           { alg: -257, type: 'public-key' }
         ],
         authenticatorSelection: {
-          // FIX #1: mereu platform
           authenticatorAttachment: 'platform',
           userVerification: 'required',
           residentKey: 'required'
@@ -205,13 +229,19 @@ async function handleRegister() {
     const credential = await navigator.credentials.create(options);
     const response = credential.response;
 
+    const alg =
+      typeof response.getPublicKeyAlgorithm === 'function'
+        ? response.getPublicKeyAlgorithm()
+        : 'unknown';
+
     MockServer.saveUser(user, {
       id: credential.id,
       rawId: toBase64(credential.rawId),
-      publicKey: toBase64(response.getPublicKey())
+      publicKey: toBase64(response.getPublicKey()),
+      publicKeyAlgorithm: alg
     });
 
-    log('Passkey salvat în sistem!');
+    log(`Passkey salvat. Alg: ${alg}`);
     showStatus(`Înregistrare finalizată prin ${providerInfo.provider}!`);
   } catch (e) {
     log(e.name + ': ' + e.message, true);
@@ -219,16 +249,39 @@ async function handleRegister() {
   }
 }
 
+function requireLocalCredential(user, data) {
+  // AGRESIV: fără allowCredentials => refuzăm login
+  if (!data?.rawId) {
+    showStatus(
+      'Nu există passkey local pentru acest user pe device-ul curent. Fă Register pe acest device (platform/Windows Hello) înainte de Login.',
+      true
+    );
+    log('Login refuzat: allowCredentials ar fi gol (nu permitem discoverable/cloud picker).', true);
+    return false;
+  }
+  return true;
+}
+
 async function handleLogin() {
   const user = document.getElementById('username').value.trim();
   const data = MockServer.getUsers()[user];
   if (!user) return showStatus('Introdu un utilizator', true);
 
+  if (!requireLocalCredential(user, data)) return;
+
   try {
     const providerInfo = detectProvider();
-    log(`Solicit autentificare prin ${providerInfo.provider}...`);
+    log(`Solicit autentificare (platform) prin ${providerInfo.provider}...`);
+
     const challenge = MockServer.generateChallenge();
     const localNonce = base64Url(crypto.getRandomValues(new Uint8Array(16)));
+
+    // AGRESIV: allowCredentials obligatoriu + transports internal
+    const allowCredentials = [{
+      id: fromBase64(data.rawId),
+      type: 'public-key',
+      transports: ['internal']
+    }];
 
     const options = {
       publicKey: {
@@ -236,8 +289,9 @@ async function handleLogin() {
         rpId: window.location.hostname || 'localhost',
         userVerification: 'required',
         hints: providerInfo.hints,
-        allowCredentials: data ? [{ id: fromBase64(data.rawId), type: 'public-key' }] : []
-      }
+        allowCredentials
+      },
+      mediation: 'required'
     };
 
     const assertion = await navigator.credentials.get(options);
@@ -249,12 +303,11 @@ async function handleLogin() {
       type: assertion.type,
       rawId: toBase64(assertion.rawId),
 
-      // FIX #1: mereu platform (nu lua din assertion)
       authenticatorAttachment: 'platform',
-
       authenticatorProvider: providerInfo.provider,
       clientExtensionResults: assertion.getClientExtensionResults(),
-      publicKeyAlgorithm: data?.publicKey ? -7 : 'unknown',
+      publicKeyAlgorithm: data?.publicKeyAlgorithm ?? 'unknown',
+
       lastLoginAt: new Date().toISOString(),
       didSessionJwt: sessionJwt,
       webauthn: 'https://www.w3.org/TR/webauthn-3/'
@@ -264,8 +317,9 @@ async function handleLogin() {
     const account = await getPublicAccountData(user);
     renderAccountView(account);
 
-    log(`Autentificare reușită. Nonce local folosit în DID: ${localNonce}`);
-    showStatus('Te-ai logat cu succes!');
+    log(`Login OK. Nonce DID: ${localNonce}`);
+    showStatus('Te-ai logat cu succes (platform/internal)!');
+
   } catch (e) {
     log(e.name + ': ' + e.message, true);
     showStatus('Eroare la autentificare', true);
@@ -274,16 +328,40 @@ async function handleLogin() {
 
 async function handleLogout() {
   clearCookies();
+  localStorage.removeItem(LAST_USER_KEY);
+
   await new Promise((resolve) => {
     const req = indexedDB.deleteDatabase(ACCOUNT_DB_NAME);
     req.onsuccess = resolve;
     req.onerror = resolve;
     req.onblocked = resolve;
   });
+
   document.getElementById('account-view').classList.add('hidden');
   document.getElementById('auth-view').classList.remove('hidden');
   showStatus('Logout realizat. Cookies + IndexedDB au fost curățate.');
   log('Logout: sesiune locală ștearsă.');
+}
+
+async function tryRestoreSessionFromCookie() {
+  const jwt = getCookie(SESSION_COOKIE);
+  if (!jwt) return false;
+
+  const payload = decodeJwtNoVerify(jwt);
+  const jwtUser = payload?.sub;
+  const lastUser = localStorage.getItem(LAST_USER_KEY);
+
+  const username = (jwtUser || lastUser || '').trim();
+  if (!username) return false;
+
+  const account = await getPublicAccountData(username);
+  if (!account) return false;
+
+  account.didSessionJwt = jwt;
+  renderAccountView(account);
+  showStatus('Sesiune restaurată automat din cookie.');
+  log(`Restore: username="${username}", provider="${payload?.provider || 'n/a'}"`);
+  return true;
 }
 
 window.handleRegister = handleRegister;
@@ -291,7 +369,7 @@ window.handleLogin = handleLogin;
 window.handleLogout = handleLogout;
 window.clearData = clearData;
 
-window.onload = () => {
+window.onload = async () => {
   const providerInfo = detectProvider();
   document.getElementById('provider-name').innerText = providerInfo.provider;
 
@@ -303,4 +381,5 @@ window.onload = () => {
   }
 
   registerServiceWorker();
+  await tryRestoreSessionFromCookie();
 };
